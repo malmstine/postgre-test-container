@@ -2,11 +2,11 @@ import dataclasses
 import subprocess
 import time
 import typing
+import logging
 from contextlib import contextmanager
 from copy import copy
-from typing import Mapping
 
-from docker.postgres import get_free_port
+from docker.utils import get_free_port
 
 
 def _to_args(arg_type, arguments):
@@ -48,6 +48,7 @@ def argument(arg) -> "ClassMethod":
 
 
 ClassMethod = typing.Callable[[], typing.Any]
+CMDArguments = typing.List[str]
 
 
 class Image:
@@ -80,7 +81,7 @@ class Image:
         self.args.append(f"{source}:{target}")
         return self
 
-    def run(self):
+    def run(self) -> CMDArguments:
         args = ["docker", "run"]
         args.extend(self.args)
         args.append(self.image_name)
@@ -96,18 +97,18 @@ class Container:
         self.container_id = container_id
         self.args = list()
 
-    def _copy(self):
+    def __copy__(self):
         d = self.__class__(self.container_id)
         d.args = copy(self.args)
         return d
 
-    def stop(self):
+    def stop(self) -> CMDArguments:
         args = ["docker", "stop"]
         args.extend(self.args)
         args.append(self.container_id)
         return args
 
-    def execute(self, command):
+    def execute(self, command) -> CMDArguments:
         args = ["docker", "exec"]
         args.extend(self.args)
         args.append(self.container_id)
@@ -115,10 +116,13 @@ class Container:
         return args
 
 
+class ContainerNotResponding(Exception):
+    pass
+
+
 class PostgreContainer:
 
     container_id: str
-    environment: Mapping
     p = None
     wait_rules: WaitRules = WaitRules(interval=5, retries=5)
     params: ConnectionParams = None
@@ -134,32 +138,39 @@ class PostgreContainer:
                                              POSTGRES_DB=params.db)
                                         .port(params.port, "5432"))
 
-        self.p = subprocess.Popen(psdc.run(),
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE)
-        self._register_container()
+        p = subprocess.Popen(psdc.run(),
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+        self._register_container(p)
         self._wait()
 
-    def _register_container(self):
-        stdout, stderr = self.p.communicate()
+    def _register_container(self, p):
+        stdout, stderr = p.communicate()
         if stderr:
             raise RuntimeError("Error run container")
         self.container_id = stdout.decode().strip("\n")
+        logging.info(f"container {self.container_id} started")
 
     def _wait(self):
         wait_rules = self.wait_rules
         psda = Container(self.container_id)
 
         for retrie in range(wait_rules.retries):
-            self.p = subprocess.Popen(psda.execute("/usr/bin/pg_isready"),
-                                      stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE)
+            logging.debug(f"try connect to {self.container_id}")
+            p = subprocess.Popen(psda.execute("/usr/bin/pg_isready"),
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
 
-            stdout, stderr = self.p.communicate()
+            stdout, stderr = p.communicate()
             if stderr:
                 raise RuntimeError(stderr)
-            if self.p.returncode:
-                time.sleep(wait_rules.interval)
+            if p.returncode == 0:
+                logging.debug(f"container {self.container_id} ready")
+                return
+            time.sleep(wait_rules.interval)
+
+        logging.error(f"container {self.container_id} not responding")
+        raise ContainerNotResponding
 
     def stop(self):
         p = subprocess.Popen(Container(self.container_id).stop(),
@@ -168,6 +179,8 @@ class PostgreContainer:
         stdout, stderr = p.communicate()
         if stderr:
             raise RuntimeError("Postgres container removed with error")
+
+        logging.info(f"container {self.container_id} removed")
 
 
 @contextmanager
@@ -188,3 +201,12 @@ def temporary_postgres(
         yield params
     finally:
         c.stop()
+
+
+__all__ = [
+    "temporary_postgres",
+    "PostgreContainer",
+    "ConnectionParams",
+    "ContainerNotResponding",
+    "WaitRules"
+]
